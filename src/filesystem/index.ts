@@ -20,6 +20,19 @@ import { minimatch } from 'minimatch';
 import { isPathWithinAllowedDirectories } from './path-validation.js';
 import { getValidRootDirectories } from './roots-utils.js';
 
+// Environment variable to control dot directory visibility
+const SHOW_DOT_DIRECTORIES = process.env.MCP_FILESYSTEM_SHOW_DOT_DIRECTORIES === 'true';
+
+// Helper function to check if a name starts with a dot (hidden file/directory)
+function isDotPath(name: string): boolean {
+  return name.startsWith('.');
+}
+
+// Helper function to determine if dot directories should be shown
+function shouldShowDotDirectories(showDot?: boolean): boolean {
+  return showDot ?? SHOW_DOT_DIRECTORIES;
+}
+
 // Command line argument parsing
 const args = process.argv.slice(2);
 if (args.length === 0) {
@@ -148,15 +161,18 @@ const CreateDirectoryArgsSchema = z.object({
 
 const ListDirectoryArgsSchema = z.object({
   path: z.string(),
+  showDot: z.boolean().optional().describe('Include dot directories and files (hidden files). Defaults to false for security.'),
 });
 
 const ListDirectoryWithSizesArgsSchema = z.object({
   path: z.string(),
   sortBy: z.enum(['name', 'size']).optional().default('name').describe('Sort entries by name or size'),
+  showDot: z.boolean().optional().describe('Include dot directories and files (hidden files). Defaults to false for security.'),
 });
 
 const DirectoryTreeArgsSchema = z.object({
   path: z.string(),
+  showDot: z.boolean().optional().describe('Include dot directories and files (hidden files). Defaults to false for security.'),
 });
 
 const MoveFileArgsSchema = z.object({
@@ -167,7 +183,8 @@ const MoveFileArgsSchema = z.object({
 const SearchFilesArgsSchema = z.object({
   path: z.string(),
   pattern: z.string(),
-  excludePatterns: z.array(z.string()).optional().default([])
+  excludePatterns: z.array(z.string()).optional().default([]),
+  showDot: z.boolean().optional().describe('Include dot directories and files (hidden files) in search. Defaults to false for security.'),
 });
 
 const GetFileInfoArgsSchema = z.object({
@@ -217,9 +234,11 @@ async function getFileStats(filePath: string): Promise<FileInfo> {
 async function searchFiles(
   rootPath: string,
   pattern: string,
-  excludePatterns: string[] = []
+  excludePatterns: string[] = [],
+  showDot: boolean = false
 ): Promise<string[]> {
   const results: string[] = [];
+  const showDotDirectories = shouldShowDotDirectories(showDot);
 
   async function search(currentPath: string) {
     const entries = await fs.readdir(currentPath, { withFileTypes: true });
@@ -230,6 +249,11 @@ async function searchFiles(
       try {
         // Validate each path before processing
         await validatePath(fullPath);
+
+        // Skip dot directories/files unless explicitly requested
+        if (!showDotDirectories && isDotPath(entry.name)) {
+          continue;
+        }
 
         // Check if path matches any exclude pattern
         const relativePath = path.relative(rootPath, fullPath);
@@ -526,8 +550,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description:
           "Get a detailed listing of all files and directories in a specified path. " +
           "Results clearly distinguish between files and directories with [FILE] and [DIR] " +
-          "prefixes. This tool is essential for understanding directory structure and " +
-          "finding specific files within a directory. Only works within allowed directories.",
+          "prefixes. By default, dot directories (like .git) are hidden for security and " +
+          "performance reasons. Use showDot parameter to include them. This tool is essential " +
+          "for understanding directory structure and finding specific files within a directory. " +
+          "Only works within allowed directories.",
         inputSchema: zodToJsonSchema(ListDirectoryArgsSchema) as ToolInput,
       },
       {
@@ -535,8 +561,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description:
           "Get a detailed listing of all files and directories in a specified path, including sizes. " +
           "Results clearly distinguish between files and directories with [FILE] and [DIR] " +
-          "prefixes. This tool is useful for understanding directory structure and " +
-          "finding specific files within a directory. Only works within allowed directories.",
+          "prefixes. By default, dot directories (like .git) are hidden for security and " +
+          "performance reasons. Use showDot parameter to include them. This tool is useful " +
+          "for understanding directory structure and finding specific files within a directory. " +
+          "Only works within allowed directories.",
         inputSchema: zodToJsonSchema(ListDirectoryWithSizesArgsSchema) as ToolInput,
       },
       {
@@ -545,7 +573,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             "Get a recursive tree view of files and directories as a JSON structure. " +
             "Each entry includes 'name', 'type' (file/directory), and 'children' for directories. " +
             "Files have no children array, while directories always have a children array (which may be empty). " +
-            "The output is formatted with 2-space indentation for readability. Only works within allowed directories.",
+            "By default, dot directories (like .git) are hidden for security and performance reasons. " +
+            "Use showDot parameter to include them. The output is formatted with 2-space indentation " +
+            "for readability. Only works within allowed directories.",
         inputSchema: zodToJsonSchema(DirectoryTreeArgsSchema) as ToolInput,
       },
       {
@@ -562,8 +592,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description:
           "Recursively search for files and directories matching a pattern. " +
           "Searches through all subdirectories from the starting path. The search " +
-          "is case-insensitive and matches partial names. Returns full paths to all " +
-          "matching items. Great for finding files when you don't know their exact location. " +
+          "is case-insensitive and matches partial names. By default, dot directories " +
+          "(like .git) are excluded for security and performance reasons. Use showDot " +
+          "parameter to include them. Returns full paths to all matching items. " +
+          "Great for finding files when you don't know their exact location. " +
           "Only searches within allowed directories.",
         inputSchema: zodToJsonSchema(SearchFilesArgsSchema) as ToolInput,
       },
@@ -719,7 +751,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         const validPath = await validatePath(parsed.data.path);
         const entries = await fs.readdir(validPath, { withFileTypes: true });
-        const formatted = entries
+        const showDotDirectories = shouldShowDotDirectories(parsed.data.showDot);
+        
+        const filteredEntries = showDotDirectories 
+          ? entries 
+          : entries.filter(entry => !isDotPath(entry.name));
+        
+        const formatted = filteredEntries
           .map((entry) => `${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${entry.name}`)
           .join("\n");
         return {
@@ -734,10 +772,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         const validPath = await validatePath(parsed.data.path);
         const entries = await fs.readdir(validPath, { withFileTypes: true });
+        const showDotDirectories = shouldShowDotDirectories(parsed.data.showDot);
+        
+        const filteredEntries = showDotDirectories 
+          ? entries 
+          : entries.filter(entry => !isDotPath(entry.name));
         
         // Get detailed information for each entry
         const detailedEntries = await Promise.all(
-          entries.map(async (entry) => {
+          filteredEntries.map(async (entry) => {
             const entryPath = path.join(validPath, entry.name);
             try {
               const stats = await fs.stat(entryPath);
@@ -805,12 +848,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 children?: TreeEntry[];
             }
 
-            async function buildTree(currentPath: string): Promise<TreeEntry[]> {
+            async function buildTree(currentPath: string, showDot: boolean = false): Promise<TreeEntry[]> {
                 const validPath = await validatePath(currentPath);
                 const entries = await fs.readdir(validPath, {withFileTypes: true});
+                const showDotDirectories = shouldShowDotDirectories(showDot);
+                
+                const filteredEntries = showDotDirectories 
+                  ? entries 
+                  : entries.filter(entry => !isDotPath(entry.name));
+                
                 const result: TreeEntry[] = [];
 
-                for (const entry of entries) {
+                for (const entry of filteredEntries) {
                     const entryData: TreeEntry = {
                         name: entry.name,
                         type: entry.isDirectory() ? 'directory' : 'file'
@@ -818,7 +867,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                     if (entry.isDirectory()) {
                         const subPath = path.join(currentPath, entry.name);
-                        entryData.children = await buildTree(subPath);
+                        entryData.children = await buildTree(subPath, showDot);
                     }
 
                     result.push(entryData);
@@ -827,7 +876,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return result;
             }
 
-            const treeData = await buildTree(parsed.data.path);
+            const treeData = await buildTree(parsed.data.path, parsed.data.showDot);
             return {
                 content: [{
                     type: "text",
@@ -855,7 +904,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error(`Invalid arguments for search_files: ${parsed.error}`);
         }
         const validPath = await validatePath(parsed.data.path);
-        const results = await searchFiles(validPath, parsed.data.pattern, parsed.data.excludePatterns);
+        const results = await searchFiles(validPath, parsed.data.pattern, parsed.data.excludePatterns, parsed.data.showDot);
         return {
           content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No matches found" }],
         };
